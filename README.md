@@ -54,7 +54,69 @@ Before using the downloader, you need Reddit API credentials:
 
 ## Quick Start
 
-### Basic Usage
+You can run the downloader in three ways:
+
+1. **Command-line with environment variables** (easiest, no config file needed)
+2. **Command-line with arguments** (all options in one command)
+3. **Python script** (most flexible, for custom workflows)
+
+### Option 1: Command-Line with Environment Variables (Recommended)
+
+Set your credentials as environment variables, then run directly:
+
+```bash
+# Set credentials (add to ~/.bashrc or ~/.zshrc to make permanent)
+export REDDIT_CLIENT_ID="your_client_id"
+export REDDIT_CLIENT_SECRET="your_client_secret"
+export REDDIT_USER_AGENT="python:research:v1.0 (by /u/your_username)"
+
+# Run the downloader
+python3 downloader.py --subreddit Python --query tutorial
+
+# Or with more options
+python3 downloader.py \
+  --subreddit Epilepsy \
+  --query "seizure" \
+  --output epilepsy_data.xlsx \
+  --window-size monthly
+```
+
+**See all options:**
+```bash
+python3 downloader.py --help
+```
+
+### Option 2: Command-Line with Arguments
+
+Pass everything as arguments (no config file or env vars needed):
+
+```bash
+python3 downloader.py \
+  --client-id your_client_id \
+  --client-secret your_client_secret \
+  --user-agent "python:research:v1.0 (by /u/username)" \
+  --subreddit Python \
+  --query tutorial \
+  --output python_tutorials.xlsx \
+  --window-size monthly
+```
+
+**Custom date range:**
+```bash
+python3 downloader.py \
+  --client-id your_id \
+  --client-secret your_secret \
+  --user-agent "your_agent" \
+  --subreddit Python \
+  --query async \
+  --start-date 2020-01-01 \
+  --end-date 2023-12-31 \
+  --no-from-beginning
+```
+
+### Option 3: Python Script (Advanced)
+
+For custom workflows or integration into other Python projects:
 
 ```python
 from downloader import OvernightExtractor
@@ -81,9 +143,9 @@ extractor.extract_complete_history(
 )
 ```
 
-### Example Configuration File
+#### Using a Configuration File
 
-Create a `config.py` file:
+You can also create a `config.py` file (copy from `config.example.py`):
 
 ```python
 # Reddit API Credentials
@@ -123,6 +185,7 @@ extractor.extract_complete_history(
 
 ### Custom Date Range
 
+**Python:**
 ```python
 from datetime import datetime
 
@@ -135,10 +198,30 @@ extractor.extract_complete_history(
 )
 ```
 
+**CLI:**
+```bash
+python3 downloader.py \
+  --subreddit Python \
+  --query async \
+  --start-date 2020-01-01 \
+  --end-date 2023-12-31 \
+  --no-from-beginning
+```
+
 ### Resuming Interrupted Extractions
 
-The downloader automatically saves progress. If interrupted, simply run the same command again:
+The downloader automatically saves progress to `extraction_progress.json`. If interrupted, simply run the same command again and it will resume from the last checkpoint.
 
+**CLI example:**
+```bash
+# Run extraction (might be interrupted)
+python3 downloader.py --subreddit Python --query tutorial
+
+# Just run the same command again - automatically resumes
+python3 downloader.py --subreddit Python --query tutorial
+```
+
+**Python example:**
 ```python
 # If this was interrupted...
 extractor.extract_complete_history(

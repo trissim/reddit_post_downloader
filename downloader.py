@@ -20,6 +20,9 @@ from pathlib import Path
 import time
 import logging
 import json
+import os
+import argparse
+import sys
 import praw
 import pandas as pd
 from praw.exceptions import RedditAPIException, PRAWException
@@ -415,26 +418,179 @@ class OvernightExtractor:
         self.logger.info(f"{'='*60}")
 
 
-# Usage example
-if __name__ == "__main__":
-    # Configure credentials
-    CLIENT_ID = "your_client_id"
-    CLIENT_SECRET = "your_client_secret"
-    USER_AGENT = "python:sudep_research:v2.0 (by /u/yourusername)"
-    
+def parse_arguments():
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(
+        description="Reddit Post Downloader - Extract posts using time-windowing to bypass 1000-post limit",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Using environment variables:
+  export REDDIT_CLIENT_ID="your_id"
+  export REDDIT_CLIENT_SECRET="your_secret"
+  export REDDIT_USER_AGENT="python:app:v1.0 (by /u/username)"
+  python3 downloader.py --subreddit Python --query tutorial
+
+  # Using command-line arguments:
+  python3 downloader.py \\
+    --client-id your_id \\
+    --client-secret your_secret \\
+    --user-agent "python:app:v1.0 (by /u/username)" \\
+    --subreddit Python \\
+    --query tutorial \\
+    --output data.xlsx
+
+  # Custom date range:
+  python3 downloader.py \\
+    --subreddit Python \\
+    --query async \\
+    --start-date 2020-01-01 \\
+    --end-date 2023-12-31
+        """
+    )
+
+    # Credentials (can use env vars or CLI args)
+    parser.add_argument(
+        "--client-id",
+        default=os.getenv("REDDIT_CLIENT_ID"),
+        help="Reddit API client ID (or set REDDIT_CLIENT_ID env var)"
+    )
+    parser.add_argument(
+        "--client-secret",
+        default=os.getenv("REDDIT_CLIENT_SECRET"),
+        help="Reddit API client secret (or set REDDIT_CLIENT_SECRET env var)"
+    )
+    parser.add_argument(
+        "--user-agent",
+        default=os.getenv("REDDIT_USER_AGENT"),
+        help="Reddit API user agent (or set REDDIT_USER_AGENT env var)"
+    )
+
+    # Required extraction parameters
+    parser.add_argument(
+        "--subreddit",
+        required=True,
+        help="Target subreddit (without r/ prefix)"
+    )
+    parser.add_argument(
+        "--query",
+        default="*",
+        help="Search query (default: '*' for all posts)"
+    )
+
+    # Output options
+    parser.add_argument(
+        "--output",
+        "-o",
+        default="reddit_data.xlsx",
+        help="Output file path (default: reddit_data.xlsx)"
+    )
+
+    # Date range options
+    parser.add_argument(
+        "--start-date",
+        help="Start date (YYYY-MM-DD format). If not specified, starts from subreddit creation"
+    )
+    parser.add_argument(
+        "--end-date",
+        help="End date (YYYY-MM-DD format). Default: today"
+    )
+    parser.add_argument(
+        "--from-beginning",
+        action="store_true",
+        default=True,
+        help="Start from subreddit creation date (default: True)"
+    )
+    parser.add_argument(
+        "--no-from-beginning",
+        action="store_false",
+        dest="from_beginning",
+        help="Don't start from beginning (use --start-date instead)"
+    )
+
+    # Performance options
+    parser.add_argument(
+        "--window-size",
+        choices=["monthly", "yearly"],
+        default="monthly",
+        help="Time window size (default: monthly)"
+    )
+
+    return parser.parse_args()
+
+
+def validate_credentials(client_id, client_secret, user_agent):
+    """Validate that required credentials are provided."""
+    missing = []
+    if not client_id:
+        missing.append("client_id (use --client-id or REDDIT_CLIENT_ID env var)")
+    if not client_secret:
+        missing.append("client_secret (use --client-secret or REDDIT_CLIENT_SECRET env var)")
+    if not user_agent:
+        missing.append("user_agent (use --user-agent or REDDIT_USER_AGENT env var)")
+
+    if missing:
+        print("ERROR: Missing required credentials:\n")
+        for item in missing:
+            print(f"  - {item}")
+        print("\nTo get Reddit API credentials:")
+        print("  1. Go to https://www.reddit.com/prefs/apps")
+        print("  2. Click 'Create App' or 'Create Another App'")
+        print("  3. Select 'script' type")
+        print("  4. Copy your client_id and client_secret")
+        print("\nSee README.md for detailed instructions.")
+        sys.exit(1)
+
+
+def main():
+    """Main entry point for command-line usage."""
+    args = parse_arguments()
+
+    # Validate credentials
+    validate_credentials(args.client_id, args.client_secret, args.user_agent)
+
+    # Parse dates if provided
+    start_date = None
+    end_date = None
+    if args.start_date:
+        try:
+            start_date = datetime.strptime(args.start_date, "%Y-%m-%d")
+        except ValueError:
+            print(f"ERROR: Invalid start date format '{args.start_date}'. Use YYYY-MM-DD")
+            sys.exit(1)
+
+    if args.end_date:
+        try:
+            end_date = datetime.strptime(args.end_date, "%Y-%m-%d")
+        except ValueError:
+            print(f"ERROR: Invalid end date format '{args.end_date}'. Use YYYY-MM-DD")
+            sys.exit(1)
+
     # Initialize extractor
+    print(f"\nInitializing Reddit Post Downloader...")
+    print(f"  Subreddit: r/{args.subreddit}")
+    print(f"  Query: {args.query}")
+    print(f"  Output: {args.output}")
+    print(f"  Window size: {args.window_size}")
+    print()
+
     extractor = OvernightExtractor(
-        client_id=CLIENT_ID,
-        client_secret=CLIENT_SECRET,
-        user_agent=USER_AGENT,
-        output_path="sudep_complete_history.xlsx"
+        client_id=args.client_id,
+        client_secret=args.client_secret,
+        user_agent=args.user_agent,
+        output_path=args.output
     )
-    
-    # Extract complete history from the very beginning of the subreddit
-    # This will automatically detect when r/Epilepsy was created
+
+    # Extract data
     extractor.extract_complete_history(
-        subreddit="Epilepsy",
-        query="sudep",
-        from_beginning=True,  # Starts from subreddit creation date
-        window_size="monthly"  # Use "yearly" for faster but less thorough
+        subreddit=args.subreddit,
+        query=args.query,
+        start_date=start_date,
+        end_date=end_date,
+        window_size=args.window_size,
+        from_beginning=args.from_beginning
     )
+
+
+if __name__ == "__main__":
+    main()
