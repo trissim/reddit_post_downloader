@@ -15,7 +15,7 @@ Requirements:
 
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta
-from typing import List, Optio:nal, Set
+from typing import List, Optional, Set
 from pathlib import Path
 import time
 import logging
@@ -83,26 +83,31 @@ class ProgressTracker:
 
 class RateLimitHandler:
     """Handles Reddit API rate limiting with exponential backoff."""
-    
-    def __init__(self, base_delay: float = 2.0, max_delay: float = 300.0):
+
+    def __init__(self, base_delay: float = 0.5, max_delay: float = 300.0):
         self.base_delay = base_delay
         self.max_delay = max_delay
         self.current_delay = base_delay
         self.logger = logging.getLogger(__name__)
-    
+        self.request_count = 0
+
     def wait(self):
-        """Wait before next request."""
-        time.sleep(self.base_delay)
-    
+        """Wait before next request (reduced delay for faster processing)."""
+        self.request_count += 1
+        # Only wait every 2 requests to reduce overhead
+        if self.request_count % 2 == 0:
+            time.sleep(self.base_delay)
+
     def handle_rate_limit(self):
         """Handle rate limit error with exponential backoff."""
         self.logger.warning(f"Rate limited. Waiting {self.current_delay:.0f}s...")
         time.sleep(self.current_delay)
         self.current_delay = min(self.current_delay * 2, self.max_delay)
-    
+
     def reset_delay(self):
         """Reset delay after successful requests."""
         self.current_delay = self.base_delay
+        self.request_count = 0
 
 
 class RedditClient:
@@ -140,26 +145,46 @@ class RedditClient:
     ) -> List[praw.models.Submission]:
         """
         Search subreddit within a specific time window.
-        
-        Uses CloudSearch syntax for date filtering.
+
+        Since Reddit's API doesn't support timestamp filtering in search queries,
+        this method performs client-side filtering by date.
         """
-        # Format: timestamp:start..end
-        time_filter = f"timestamp:{int(start_date.timestamp())}..{int(end_date.timestamp())}"
-        search_query = f"{query} (and {time_filter})"
-        
         self.logger.info(f"Searching {start_date.date()} to {end_date.date()}")
-        
+
         try:
             sub = self.reddit.subreddit(subreddit)
             results = []
-            
-            for submission in sub.search(search_query, sort=sort, limit=None):
+            posts_checked = 0
+
+            # Search without timestamp filter, then filter client-side
+            for submission in sub.search(query, sort=sort, limit=None):
+                posts_checked += 1
+                submission_date = datetime.fromtimestamp(submission.created_utc)
+
+                # If post is after the end date, skip it
+                if submission_date > end_date:
+                    continue
+
+                # If post is before the start date, we've gone too far (assuming sorted by new)
+                if submission_date < start_date:
+                    self.logger.info(f"Reached posts before start date after checking {posts_checked} posts")
+                    break
+
+                # Post is within the time window
                 results.append(submission)
-                self.rate_limiter.wait()
-            
-            self.rate_limiter.reset_delay()
+
+                # Log progress every 10 posts
+                if len(results) % 10 == 0:
+                    self.logger.info(f"  Found {len(results)} posts so far...")
+
+                # Safety limit to prevent infinite loops
+                if posts_checked > 10000:
+                    self.logger.warning(f"Reached safety limit of 10000 posts checked")
+                    break
+
+            self.logger.info(f"Checked {posts_checked} posts, found {len(results)} in time window")
             return results
-            
+
         except RedditAPIException as e:
             if 'RATELIMIT' in str(e):
                 self.rate_limiter.handle_rate_limit()
