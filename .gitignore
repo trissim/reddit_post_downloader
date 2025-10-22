@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# Extraction artifacts
+extraction_progress.json
+extraction.log
+*.tmp.xlsx
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo

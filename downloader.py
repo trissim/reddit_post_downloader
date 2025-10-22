@@ -15,7 +15,7 @@ Requirements:
 
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta
-from typing import List, Optio:nal, Set
+from typing import List, Optional, Set
 from pathlib import Path
 import time
 import logging
@@ -418,23 +418,24 @@ class OvernightExtractor:
 # Usage example
 if __name__ == "__main__":
     # Configure credentials
-    CLIENT_ID = "your_client_id"
-    CLIENT_SECRET = "your_client_secret"
-    USER_AGENT = "python:sudep_research:v2.0 (by /u/yourusername)"
+    CLIENT_ID = "prBByrnTuSK2gkDs6xu3Fw"
+    CLIENT_SECRET = "_qHruKld-sgANqBt4M_1bCOu9q59lA"
+    USER_AGENT = "python:epilepsy_research:v1.0 (by /u/reddituser)"
     
     # Initialize extractor
     extractor = OvernightExtractor(
         client_id=CLIENT_ID,
         client_secret=CLIENT_SECRET,
         user_agent=USER_AGENT,
-        output_path="sudep_complete_history.xlsx"
+        output_path="epilepsy_posts.xlsx"
     )
     
-    # Extract complete history from the very beginning of the subreddit
-    # This will automatically detect when r/Epilepsy was created
+    # Extract posts from the epilepsy subreddit
+    # Using a recent time window to get a manageable amount of posts
     extractor.extract_complete_history(
-        subreddit="Epilepsy",
-        query="sudep",
-        from_beginning=True,  # Starts from subreddit creation date
-        window_size="monthly"  # Use "yearly" for faster but less thorough
+        subreddit="epilepsy",
+        query="",  # Empty query to get all posts
+        from_beginning=False,  # Start from recent past
+        start_date=datetime.now() - timedelta(days=30),  # Last 30 days
+        window_size="monthly"
     )
