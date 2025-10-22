@@ -23,6 +23,7 @@ import json
 import os
 import argparse
 import sys
+import requests
 import praw
 import pandas as pd
 from praw.exceptions import RedditAPIException, PRAWException
@@ -108,9 +109,120 @@ class RateLimitHandler:
         self.current_delay = self.base_delay
 
 
+class AnonymousRedditClient:
+    """
+    Anonymous Reddit client using Reddit's public JSON API (no authentication required).
+
+    Uses Reddit's public JSON endpoints. Works for recent data without any credentials.
+    Perfect for quick data collection and testing without API setup.
+    """
+
+    def __init__(self):
+        self.rate_limiter = RateLimitHandler(base_delay=2.0)  # Be nice to Reddit
+        self.logger = logging.getLogger(__name__)
+        self.session = requests.Session()
+        self.session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        })
+
+    def get_subreddit_creation_date(self, subreddit: str) -> datetime:
+        """Get approximate subreddit creation date (fallback to 2008)."""
+        self.logger.info(f"Using anonymous mode - starting from 2008 for r/{subreddit}")
+        return datetime(2008, 1, 1)  # Pushshift data starts around 2008
+
+    def search_time_window(
+        self,
+        subreddit: str,
+        query: str,
+        start_date: datetime,
+        end_date: datetime,
+        sort: str = "new"
+    ) -> List[dict]:
+        """
+        Search subreddit using Reddit's public JSON API within a time window.
+
+        Returns list of submission dictionaries (not PRAW objects).
+        Note: Limited to ~1000 posts per window due to Reddit API limitations.
+        """
+        self.logger.info(f"Reddit JSON API: Searching {start_date.date()} to {end_date.date()}")
+
+        all_results = []
+        after = None  # Pagination token
+        attempts = 0
+        max_attempts = 40  # 40 pages * 25 = 1000 posts max
+
+        try:
+            while attempts < max_attempts:
+                self.rate_limiter.wait()
+
+                # Build URL - Reddit's JSON endpoints
+                if query and query != "*":
+                    # Search endpoint
+                    url = f"https://www.reddit.com/r/{subreddit}/search.json"
+                    params = {
+                        'q': query,
+                        'restrict_sr': 'true',
+                        'sort': sort,
+                        'limit': 100,
+                        't': 'all'
+                    }
+                else:
+                    # Just get all posts
+                    url = f"https://www.reddit.com/r/{subreddit}/{sort}.json"
+                    params = {'limit': 100}
+
+                if after:
+                    params['after'] = after
+
+                response = self.session.get(url, params=params, timeout=30)
+                response.raise_for_status()
+
+                data = response.json()
+                children = data.get('data', {}).get('children', [])
+
+                if not children:
+                    break
+
+                # Filter by date range
+                for child in children:
+                    post_data = child['data']
+                    post_time = datetime.fromtimestamp(post_data['created_utc'])
+
+                    # Skip if outside date range
+                    if post_time < start_date:
+                        attempts = max_attempts  # Stop searching, we've gone too far back
+                        break
+                    if post_time > end_date:
+                        continue  # Skip future posts
+
+                    all_results.append(post_data)
+
+                self.logger.info(f"  Retrieved {len(children)} posts (filtered: {len(all_results)})")
+
+                # Get next page token
+                after = data.get('data', {}).get('after')
+                if not after:
+                    break
+
+                attempts += 1
+
+            self.rate_limiter.reset_delay()
+            self.logger.info(f"  Total posts in date range: {len(all_results)}")
+            return all_results
+
+        except requests.exceptions.RequestException as e:
+            self.logger.error(f"Reddit API error: {e}")
+            return []
+        except Exception as e:
+            self.logger.error(f"Error in Reddit JSON search: {e}")
+            import traceback
+            traceback.print_exc()
+            return []
+
+
 class RedditClient:
     """Enhanced Reddit client with time-windowing and error handling."""
-    
+
     def __init__(self, client_id: str, client_secret: str, user_agent: str):
         self.reddit = praw.Reddit(
             client_id=client_id,
@@ -175,15 +287,21 @@ class RedditClient:
 
 class PostParser:
     """Parses Reddit submissions with error handling."""
-    
-    def __init__(self):
+
+    def __init__(self, anonymous_mode: bool = False):
         self.logger = logging.getLogger(__name__)
-    
-    def parse_submission(self, submission: praw.models.Submission) -> Optional[RedditPost]:
-        """Extract data from a Reddit submission."""
+        self.anonymous_mode = anonymous_mode
+
+    def parse_submission(self, submission) -> Optional[RedditPost]:
+        """Extract data from a Reddit submission (PRAW object or dict)."""
+        # Handle Pushshift dict format
+        if isinstance(submission, dict):
+            return self.parse_pushshift_submission(submission)
+
+        # Handle PRAW object format
         try:
             submission.comments.replace_more(limit=0)
-            
+
             return RedditPost(
                 url=f"https://www.reddit.com{submission.permalink}",
                 title=submission.title,
@@ -195,14 +313,31 @@ class PostParser:
                 text_comments=self._extract_comments(submission.comments)
             )
         except Exception as e:
-            self.logger.error(f"Error parsing submission {submission.id}: {e}")
+            self.logger.error(f"Error parsing submission: {e}")
             return None
-    
+
+    def parse_pushshift_submission(self, data: dict) -> Optional[RedditPost]:
+        """Parse a Pushshift API submission dictionary."""
+        try:
+            return RedditPost(
+                url=data.get('full_link', f"https://reddit.com{data.get('permalink', '')}"),
+                title=data.get('title', '[No Title]'),
+                date=datetime.fromtimestamp(data.get('created_utc', 0)),
+                user=data.get('author', '[deleted]'),
+                n_votes=data.get('score', 0),
+                n_comments=data.get('num_comments', 0),
+                text_op=data.get('selftext', ''),
+                text_comments=""  # Pushshift submissions don't include comments
+            )
+        except Exception as e:
+            self.logger.error(f"Error parsing Pushshift submission: {e}")
+            return None
+
     @staticmethod
     def _extract_comments(comment_forest) -> str:
         """Recursively extract all comment text."""
         comments = []
-        
+
         for comment in comment_forest:
             if isinstance(comment, praw.models.Comment):
                 try:
@@ -210,7 +345,7 @@ class PostParser:
                     comments.append(f"{author}\n{comment.body}")
                 except Exception:
                     continue
-        
+
         return "\n\n".join(comments)
 
 
@@ -301,19 +436,47 @@ class TimeWindowGenerator:
 
 class OvernightExtractor:
     """Main orchestrator for overnight extraction."""
-    
+
     def __init__(
         self,
-        client_id: str,
-        client_secret: str,
-        user_agent: str,
-        output_path: str = "reddit_data.xlsx"
+        client_id: Optional[str] = None,
+        client_secret: Optional[str] = None,
+        user_agent: Optional[str] = None,
+        output_path: str = "reddit_data.xlsx",
+        anonymous: bool = False
     ):
-        self.client = RedditClient(client_id, client_secret, user_agent)
-        self.parser = PostParser()
+        """
+        Initialize the extractor.
+
+        Args:
+            client_id: Reddit API client ID (not needed if anonymous=True)
+            client_secret: Reddit API client secret (not needed if anonymous=True)
+            user_agent: Reddit API user agent (not needed if anonymous=True)
+            output_path: Path to output Excel file
+            anonymous: Use Pushshift API (no credentials required, historical data)
+        """
+        self.anonymous = anonymous
+
+        if anonymous:
+            self.client = AnonymousRedditClient()
+            self.logger = self._setup_logging()
+            self.logger.info("=" * 60)
+            self.logger.info("ANONYMOUS MODE: Using Pushshift API")
+            self.logger.info("No credentials required!")
+            self.logger.info("Note: Data may be a few months behind current")
+            self.logger.info("=" * 60)
+        else:
+            if not all([client_id, client_secret, user_agent]):
+                raise ValueError(
+                    "client_id, client_secret, and user_agent are required "
+                    "when not using anonymous mode. Use anonymous=True to skip credentials."
+                )
+            self.client = RedditClient(client_id, client_secret, user_agent)
+            self.logger = self._setup_logging()
+
+        self.parser = PostParser(anonymous_mode=anonymous)
         self.exporter = IncrementalExporter(output_path)
         self.progress = ProgressTracker()
-        self.logger = self._setup_logging()
     
     def _setup_logging(self) -> logging.Logger:
         """Configure logging."""
@@ -383,14 +546,17 @@ class OvernightExtractor:
                 
                 window_posts = 0
                 for submission in submissions:
+                    # Get submission ID (handle both PRAW objects and dicts)
+                    sub_id = submission['id'] if isinstance(submission, dict) else submission.id
+
                     # Skip if already processed
-                    if self.progress.is_processed(submission.id):
+                    if self.progress.is_processed(sub_id):
                         continue
-                    
+
                     post = self.parser.parse_submission(submission)
                     if post:
                         self.exporter.add_post(post)
-                        self.progress.mark_processed(submission.id)
+                        self.progress.mark_processed(sub_id)
                         window_posts += 1
                         total_posts += 1
                 
@@ -425,6 +591,13 @@ def parse_arguments():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
+  # ANONYMOUS MODE (NO CREDENTIALS NEEDED!):
+  python3 downloader.py --anonymous --subreddit Python --query tutorial
+
+  # Anonymous mode with date range (last 3 months):
+  python3 downloader.py --anonymous --subreddit Python \\
+    --start-date 2024-07-01 --end-date 2024-10-01 --no-from-beginning
+
   # Using environment variables:
   export REDDIT_CLIENT_ID="your_id"
   export REDDIT_CLIENT_SECRET="your_secret"
@@ -516,6 +689,13 @@ Examples:
         help="Time window size (default: monthly)"
     )
 
+    # Anonymous mode
+    parser.add_argument(
+        "--anonymous",
+        action="store_true",
+        help="Use Pushshift API (no credentials required, historical data only)"
+    )
+
     return parser.parse_args()
 
 
@@ -546,8 +726,9 @@ def main():
     """Main entry point for command-line usage."""
     args = parse_arguments()
 
-    # Validate credentials
-    validate_credentials(args.client_id, args.client_secret, args.user_agent)
+    # Validate credentials (skip if anonymous mode)
+    if not args.anonymous:
+        validate_credentials(args.client_id, args.client_secret, args.user_agent)
 
     # Parse dates if provided
     start_date = None
@@ -568,6 +749,11 @@ def main():
 
     # Initialize extractor
     print(f"\nInitializing Reddit Post Downloader...")
+    if args.anonymous:
+        print(f"  Mode: ANONYMOUS (Pushshift API)")
+        print(f"  Note: Data may be a few months behind current")
+    else:
+        print(f"  Mode: Authenticated (Reddit API)")
     print(f"  Subreddit: r/{args.subreddit}")
     print(f"  Query: {args.query}")
     print(f"  Output: {args.output}")
@@ -578,7 +764,8 @@ def main():
         client_id=args.client_id,
         client_secret=args.client_secret,
         user_agent=args.user_agent,
-        output_path=args.output
+        output_path=args.output,
+        anonymous=args.anonymous
     )
 
     # Extract data
