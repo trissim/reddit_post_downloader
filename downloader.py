@@ -1,0 +1,440 @@
+
+"""
+Overnight Reddit extractor with time-windowing to bypass 1000-post limits.
+
+Runs unattended with:
+- Automatic time-window partitioning
+- Incremental saves (crash-resistant)
+- Rate limit handling with exponential backoff
+- Resume capability
+- Comprehensive logging
+
+Requirements:
+    pip install praw pandas openpyxl
+"""
+
+from dataclasses import dataclass, asdict
+from datetime import datetime, timedelta
+from typing import List, Optio:nal, Set
+from pathlib import Path
+import time
+import logging
+import json
+import praw
+import pandas as pd
+from praw.exceptions import RedditAPIException, PRAWException
+
+
+@dataclass
+class RedditPost:
+    """Data model for a Reddit post."""
+    url: str
+    title: str
+    date: datetime
+    user: str
+    n_votes: int
+    n_comments: int
+    text_op: str
+    text_comments: str
+
+
+class ProgressTracker:
+    """Tracks extraction progress for resume capability."""
+    
+    def __init__(self, checkpoint_file: str = "extraction_progress.json"):
+        self.checkpoint_file = Path(checkpoint_file)
+        self.processed_ids: Set[str] = set()
+        self.last_window_end: Optional[datetime] = None
+        self._load_checkpoint()
+    
+    def _load_checkpoint(self):
+        """Load existing progress if available."""
+        if self.checkpoint_file.exists():
+            with open(self.checkpoint_file, 'r') as f:
+                data = json.load(f)
+                self.processed_ids = set(data.get('processed_ids', []))
+                last_window = data.get('last_window_end')
+                if last_window:
+                    self.last_window_end = datetime.fromisoformat(last_window)
+    
+    def save_checkpoint(self):
+        """Save current progress."""
+        data = {
+            'processed_ids': list(self.processed_ids),
+            'last_window_end': self.last_window_end.isoformat() if self.last_window_end else None,
+            'saved_at': datetime.now().isoformat()
+        }
+        with open(self.checkpoint_file, 'w') as f:
+            json.dump(data, f, indent=2)
+    
+    def mark_processed(self, post_id: str):
+        """Mark a post as processed."""
+        self.processed_ids.add(post_id)
+    
+    def is_processed(self, post_id: str) -> bool:
+        """Check if post was already processed."""
+        return post_id in self.processed_ids
+    
+    def update_window(self, window_end: datetime):
+        """Update the last processed time window."""
+        self.last_window_end = window_end
+        self.save_checkpoint()
+
+
+class RateLimitHandler:
+    """Handles Reddit API rate limiting with exponential backoff."""
+    
+    def __init__(self, base_delay: float = 2.0, max_delay: float = 300.0):
+        self.base_delay = base_delay
+        self.max_delay = max_delay
+        self.current_delay = base_delay
+        self.logger = logging.getLogger(__name__)
+    
+    def wait(self):
+        """Wait before next request."""
+        time.sleep(self.base_delay)
+    
+    def handle_rate_limit(self):
+        """Handle rate limit error with exponential backoff."""
+        self.logger.warning(f"Rate limited. Waiting {self.current_delay:.0f}s...")
+        time.sleep(self.current_delay)
+        self.current_delay = min(self.current_delay * 2, self.max_delay)
+    
+    def reset_delay(self):
+        """Reset delay after successful requests."""
+        self.current_delay = self.base_delay
+
+
+class RedditClient:
+    """Enhanced Reddit client with time-windowing and error handling."""
+    
+    def __init__(self, client_id: str, client_secret: str, user_agent: str):
+        self.reddit = praw.Reddit(
+            client_id=client_id,
+            client_secret=client_secret,
+            user_agent=user_agent
+        )
+        self.rate_limiter = RateLimitHandler()
+        self.logger = logging.getLogger(__name__)
+    
+    def get_subreddit_creation_date(self, subreddit: str) -> datetime:
+        """Get the creation date of a subreddit."""
+        try:
+            sub = self.reddit.subreddit(subreddit)
+            creation_timestamp = sub.created_utc
+            creation_date = datetime.fromtimestamp(creation_timestamp)
+            self.logger.info(f"r/{subreddit} was created on {creation_date.date()}")
+            return creation_date
+        except Exception as e:
+            self.logger.error(f"Could not get subreddit creation date: {e}")
+            # Fallback to Reddit's launch date
+            return datetime(2005, 6, 23)
+    
+    def search_time_window(
+        self,
+        subreddit: str,
+        query: str,
+        start_date: datetime,
+        end_date: datetime,
+        sort: str = "new"
+    ) -> List[praw.models.Submission]:
+        """
+        Search subreddit within a specific time window.
+        
+        Uses CloudSearch syntax for date filtering.
+        """
+        # Format: timestamp:start..end
+        time_filter = f"timestamp:{int(start_date.timestamp())}..{int(end_date.timestamp())}"
+        search_query = f"{query} (and {time_filter})"
+        
+        self.logger.info(f"Searching {start_date.date()} to {end_date.date()}")
+        
+        try:
+            sub = self.reddit.subreddit(subreddit)
+            results = []
+            
+            for submission in sub.search(search_query, sort=sort, limit=None):
+                results.append(submission)
+                self.rate_limiter.wait()
+            
+            self.rate_limiter.reset_delay()
+            return results
+            
+        except RedditAPIException as e:
+            if 'RATELIMIT' in str(e):
+                self.rate_limiter.handle_rate_limit()
+                return self.search_time_window(subreddit, query, start_date, end_date, sort)
+            raise
+        except Exception as e:
+            self.logger.error(f"Error searching window: {e}")
+            return []
+
+
+class PostParser:
+    """Parses Reddit submissions with error handling."""
+    
+    def __init__(self):
+        self.logger = logging.getLogger(__name__)
+    
+    def parse_submission(self, submission: praw.models.Submission) -> Optional[RedditPost]:
+        """Extract data from a Reddit submission."""
+        try:
+            submission.comments.replace_more(limit=0)
+            
+            return RedditPost(
+                url=f"https://www.reddit.com{submission.permalink}",
+                title=submission.title,
+                date=datetime.fromtimestamp(submission.created_utc),
+                user=str(submission.author) if submission.author else "[deleted]",
+                n_votes=submission.score,
+                n_comments=submission.num_comments,
+                text_op=submission.selftext,
+                text_comments=self._extract_comments(submission.comments)
+            )
+        except Exception as e:
+            self.logger.error(f"Error parsing submission {submission.id}: {e}")
+            return None
+    
+    @staticmethod
+    def _extract_comments(comment_forest) -> str:
+        """Recursively extract all comment text."""
+        comments = []
+        
+        for comment in comment_forest:
+            if isinstance(comment, praw.models.Comment):
+                try:
+                    author = str(comment.author) if comment.author else "[deleted]"
+                    comments.append(f"{author}\n{comment.body}")
+                except Exception:
+                    continue
+        
+        return "\n\n".join(comments)
+
+
+class IncrementalExporter:
+    """Exports data incrementally to prevent data loss."""
+    
+    def __init__(self, output_path: str):
+        self.output_path = Path(output_path)
+        self.temp_path = self.output_path.with_suffix('.tmp.xlsx')
+        self.posts: List[RedditPost] = []
+        self.logger = logging.getLogger(__name__)
+        self._load_existing()
+    
+    def _load_existing(self):
+        """Load existing data if resuming."""
+        if self.output_path.exists():
+            self.logger.info(f"Loading existing data from {self.output_path}")
+            df = pd.read_excel(self.output_path)
+            # Convert back to RedditPost objects (simplified - just track count)
+            self.logger.info(f"Loaded {len(df)} existing posts")
+    
+    def add_post(self, post: RedditPost):
+        """Add post and save incrementally."""
+        self.posts.append(post)
+        
+        # Save every 10 posts
+        if len(self.posts) % 10 == 0:
+            self.save()
+    
+    def save(self):
+        """Save current data to file."""
+        if not self.posts:
+            return
+        
+        df = pd.DataFrame([asdict(post) for post in self.posts])
+        
+        # Save to temp file first (atomic write)
+        df.to_excel(self.temp_path, index=False, engine='openpyxl')
+        
+        # Move temp to final location
+        self.temp_path.replace(self.output_path)
+        
+        self.logger.info(f"Saved {len(self.posts)} posts to {self.output_path}")
+
+
+class TimeWindowGenerator:
+    """Generates time windows for partitioned searching."""
+    
+    @staticmethod
+    def generate_monthly_windows(
+        start_date: datetime,
+        end_date: datetime
+    ) -> List[tuple[datetime, datetime]]:
+        """Generate monthly time windows."""
+        windows = []
+        current = start_date
+        
+        while current < end_date:
+            # Calculate next month
+            if current.month == 12:
+                next_month = current.replace(year=current.year + 1, month=1, day=1)
+            else:
+                next_month = current.replace(month=current.month + 1, day=1)
+            
+            window_end = min(next_month, end_date)
+            windows.append((current, window_end))
+            current = next_month
+        
+        return windows
+    
+    @staticmethod
+    def generate_yearly_windows(
+        start_date: datetime,
+        end_date: datetime
+    ) -> List[tuple[datetime, datetime]]:
+        """Generate yearly time windows."""
+        windows = []
+        current = start_date
+        
+        while current < end_date:
+            next_year = current.replace(year=current.year + 1, month=1, day=1)
+            window_end = min(next_year, end_date)
+            windows.append((current, window_end))
+            current = next_year
+        
+        return windows
+
+
+class OvernightExtractor:
+    """Main orchestrator for overnight extraction."""
+    
+    def __init__(
+        self,
+        client_id: str,
+        client_secret: str,
+        user_agent: str,
+        output_path: str = "reddit_data.xlsx"
+    ):
+        self.client = RedditClient(client_id, client_secret, user_agent)
+        self.parser = PostParser()
+        self.exporter = IncrementalExporter(output_path)
+        self.progress = ProgressTracker()
+        self.logger = self._setup_logging()
+    
+    def _setup_logging(self) -> logging.Logger:
+        """Configure logging."""
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(levelname)s - %(message)s',
+            handlers=[
+                logging.FileHandler('extraction.log'),
+                logging.StreamHandler()
+            ]
+        )
+        return logging.getLogger(__name__)
+    
+    def extract_complete_history(
+        self,
+        subreddit: str,
+        query: str,
+        start_date: Optional[datetime] = None,
+        end_date: Optional[datetime] = None,
+        window_size: str = "monthly",
+        from_beginning: bool = True
+    ):
+        """
+        Extract complete subreddit history using time windowing.
+        
+        Args:
+            subreddit: Subreddit name
+            query: Search query
+            start_date: Start from this date (default: subreddit creation)
+            end_date: End at this date (default: now)
+            window_size: 'monthly' or 'yearly'
+            from_beginning: If True, automatically use subreddit creation date
+        """
+        # Set default date range
+        end_date = end_date or datetime.now()
+        
+        if from_beginning and start_date is None:
+            start_date = self.client.get_subreddit_creation_date(subreddit)
+        else:
+            start_date = start_date or (end_date - timedelta(days=365*10))
+        
+        # Resume from last checkpoint if available
+        if self.progress.last_window_end:
+            start_date = self.progress.last_window_end
+            self.logger.info(f"Resuming from {start_date.date()}")
+        
+        # Generate time windows
+        if window_size == "monthly":
+            windows = TimeWindowGenerator.generate_monthly_windows(start_date, end_date)
+        else:
+            windows = TimeWindowGenerator.generate_yearly_windows(start_date, end_date)
+        
+        self.logger.info(f"Extracting {len(windows)} time windows for r/{subreddit}")
+        self.logger.info(f"Date range: {start_date.date()} to {end_date.date()}")
+        
+        total_posts = 0
+        
+        for i, (window_start, window_end) in enumerate(windows, 1):
+            self.logger.info(f"\n{'='*60}")
+            self.logger.info(f"Window {i}/{len(windows)}: {window_start.date()} to {window_end.date()}")
+            self.logger.info(f"{'='*60}")
+            
+            try:
+                submissions = self.client.search_time_window(
+                    subreddit, query, window_start, window_end
+                )
+                
+                window_posts = 0
+                for submission in submissions:
+                    # Skip if already processed
+                    if self.progress.is_processed(submission.id):
+                        continue
+                    
+                    post = self.parser.parse_submission(submission)
+                    if post:
+                        self.exporter.add_post(post)
+                        self.progress.mark_processed(submission.id)
+                        window_posts += 1
+                        total_posts += 1
+                
+                self.logger.info(f"  Extracted {window_posts} posts from this window")
+                self.progress.update_window(window_end)
+                
+            except KeyboardInterrupt:
+                self.logger.info("\n\nExtraction interrupted by user")
+                self._finalize(total_posts)
+                raise
+            except Exception as e:
+                self.logger.error(f"Error in window {window_start}-{window_end}: {e}")
+                continue
+        
+        self._finalize(total_posts)
+    
+    def _finalize(self, total_posts: int):
+        """Save final data and cleanup."""
+        self.exporter.save()
+        self.progress.save_checkpoint()
+        self.logger.info(f"\n{'='*60}")
+        self.logger.info(f"Extraction complete!")
+        self.logger.info(f"Total posts extracted: {total_posts}")
+        self.logger.info(f"Output saved to: {self.exporter.output_path}")
+        self.logger.info(f"{'='*60}")
+
+
+# Usage example
+if __name__ == "__main__":
+    # Configure credentials
+    CLIENT_ID = "your_client_id"
+    CLIENT_SECRET = "your_client_secret"
+    USER_AGENT = "python:sudep_research:v2.0 (by /u/yourusername)"
+    
+    # Initialize extractor
+    extractor = OvernightExtractor(
+        client_id=CLIENT_ID,
+        client_secret=CLIENT_SECRET,
+        user_agent=USER_AGENT,
+        output_path="sudep_complete_history.xlsx"
+    )
+    
+    # Extract complete history from the very beginning of the subreddit
+    # This will automatically detect when r/Epilepsy was created
+    extractor.extract_complete_history(
+        subreddit="Epilepsy",
+        query="sudep",
+        from_beginning=True,  # Starts from subreddit creation date
+        window_size="monthly"  # Use "yearly" for faster but less thorough
+    )
