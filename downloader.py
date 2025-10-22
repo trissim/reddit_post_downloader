@@ -15,7 +15,7 @@ Requirements:
 
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta
-from typing import List, Optio:nal, Set
+from typing import List, Optional, Set
 from pathlib import Path
 import time
 import logging
